@@ -1,13 +1,8 @@
-
 name: Actualize enterprise solution
 
 on:
   workflow_dispatch:
     inputs:
-      stack_configuration_id:
-        description: Expected current HCP Terraform Stack configuration ID
-        required: true
-        type: string
       solution_definitions_release_tag:
         description: Solution Definitions release tag
         required: true
@@ -16,35 +11,27 @@ on:
 permissions:
   contents: read
   id-token: write
-  attestations: write
-  artifact-metadata: write
-
-# Avoid overlapping actualization workflows.
-concurrency:
-  group: enterprise-solution-actualization
-  cancel-in-progress: false
 
 jobs:
   actualize:
-    name: Actualize and retrieve topology
+    name: Actualize enterprise solution
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
     env:
       HCP_STACK_ID: ${{ vars.SOLUTION_ACTUALIZATION_STACK_ID }}
       HCP_TOKEN_SECRET_ID: ${{ vars.AMIASEA_TFE_TOKEN_VERSIONLESS_ID }}
-      STACK_CONFIGURATION_ID: ${{ inputs.stack_configuration_id }}
       RELEASE_TAG: ${{ inputs.solution_definitions_release_tag }}
 
     steps:
-      - name: Authenticate to Azure using OIDC
+      - name: Authenticate to Azure
         uses: azure/login@v3.1.0
         with:
           client-id: ${{ vars.AZURE_INSTITUTIVE_CLIENT_ID }}
           tenant-id: ${{ vars.AZURE_INSTITUTIVE_TENANT_ID }}
           subscription-id: ${{ vars.AZURE_INSTITUTIVE_SUBSCRIPTION_ID }}
 
-      - name: Retrieve HCP Terraform token from Key Vault
+      - name: Retrieve HCP Terraform token
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -59,33 +46,23 @@ jobs:
             --output tsv
 
           if ($LASTEXITCODE -ne 0 -or -not $token) {
-            throw "Failed to retrieve the HCP Terraform token from Key Vault."
+            throw "Failed to retrieve HCP Terraform token."
           }
 
           Write-Output "::add-mask::$token"
-
           "HCP_TOKEN=$token" >> $env:GITHUB_ENV
 
-      - name: Update release selection and fetch Stack configuration
-        id: configuration
+      - name: Actualize
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
 
-          if (-not $env:HCP_STACK_ID) {
-            throw "SOLUTION_ACTUALIZATION_STACK_ID is not configured."
-          }
-
-          if (-not $env:HCP_TOKEN) {
-            throw "Failed to retrieve the HCP Terraform token."
-          }
-
-          if (-not $env:STACK_CONFIGURATION_ID) {
-            throw "The stack_configuration_id input is required."
+          if (-not $env:HCP_STACK_ID -or -not $env:HCP_TOKEN) {
+            throw "Stack ID or HCP Terraform token is missing."
           }
 
           if ($env:RELEASE_TAG -notmatch '^v\d+\.\d+\.\d+-[A-Za-z0-9]+$') {
-            throw "Release tag '$env:RELEASE_TAG' does not follow the expected format."
+            throw "Invalid Solution Definitions release tag: $env:RELEASE_TAG"
           }
 
           $api = "https://app.terraform.io/api/v2"
@@ -98,7 +75,7 @@ jobs:
           function Invoke-HcpApi {
             param(
               [Parameter(Mandatory)]
-              [ValidateSet("GET", "PATCH")]
+              [ValidateSet("GET", "PATCH", "POST")]
               [string]$Method,
 
               [Parameter(Mandatory)]
@@ -107,15 +84,8 @@ jobs:
               [object]$Body
             )
 
-            if ($Path -match '^https://') {
-              $uri = $Path
-            }
-            else {
-              $uri = "$api$Path"
-            }
-
             $parameters = @{
-              Uri         = $uri
+              Uri         = "$api$Path"
               Method      = $Method
               Headers     = $headers
               ErrorAction = "Stop"
@@ -123,10 +93,10 @@ jobs:
 
             if ($null -ne $Body) {
               $parameters.ContentType = "application/vnd.api+json"
-              $parameters.Body = $Body | ConvertTo-Json -Depth 100 -Compress
+              $parameters.Body = $Body | ConvertTo-Json -Depth 20 -Compress
             }
 
-            return Invoke-RestMethod @parameters
+            Invoke-RestMethod @parameters
           }
 
           function Get-HcpCollection {
@@ -140,63 +110,28 @@ jobs:
 
             while ($next) {
               $response = Invoke-HcpApi -Method GET -Path $next
-
               $items += @($response.data)
               $next = $response.links.next
+
+              if ($next -match '^https://') {
+                $next = $next -replace '^https://app\.terraform\.io/api/v2', ''
+              }
             }
 
             return ,$items
           }
 
-          Write-Host ""
-          Write-Host "Execution context:"
-          Write-Host "  Stack:                 $env:HCP_STACK_ID"
-          Write-Host "  Expected configuration: $env:STACK_CONFIGURATION_ID"
-          Write-Host "  Release:               $env:RELEASE_TAG"
+          Write-Host "Stack: $env:HCP_STACK_ID"
+          Write-Host "Solution Definitions release: $env:RELEASE_TAG"
 
-          # Verify the supplied configuration belongs to this Stack
-          # and is currently the latest configuration.
-          #
-          # It is a baseline/precondition, not the configuration that
-          # will be executed by this workflow.
-
-          $configurations = @(
-            Get-HcpCollection `
-              -Path "/stacks/$env:HCP_STACK_ID/stack-configurations?page%5Bsize%5D=100"
-          )
-
-          $baselineConfiguration = @($configurations) |
-            Where-Object { $_.id -eq $env:STACK_CONFIGURATION_ID } |
-            Select-Object -First 1
-
-          if (-not $baselineConfiguration) {
-            throw "Configuration '$env:STACK_CONFIGURATION_ID' does not belong to Stack '$env:HCP_STACK_ID'."
-          }
-
-          $latestConfiguration = @($configurations) |
-            Sort-Object { [int]$_.attributes.'sequence-number' } -Descending |
-            Select-Object -First 1
-
-          if ($latestConfiguration.id -ne $env:STACK_CONFIGURATION_ID) {
-            throw "The supplied configuration is not the latest Stack configuration. Latest: '$($latestConfiguration.id)'."
-          }
-
-          if ($baselineConfiguration.attributes.status -ne "completed") {
-            throw "The supplied configuration must be completed. Current status: '$($baselineConfiguration.attributes.status)'."
-          }
-
-          $baselineSequence = [int]$baselineConfiguration.attributes.'sequence-number'
-
-          Write-Host "Verified baseline configuration sequence: $baselineSequence"
-
-          # Locate the enterprise-solution-actualization variable set.
+          # Locate the actualization variable set.
 
           $varsets = @(
             Get-HcpCollection `
               -Path "/organizations/amiasea/varsets?q=enterprise-solution-actualization"
           )
 
-          $varset = @($varsets) |
+          $varset = $varsets |
             Where-Object {
               $_.attributes.name -eq "enterprise-solution-actualization"
             } |
@@ -206,29 +141,24 @@ jobs:
             throw "Variable set 'enterprise-solution-actualization' was not found."
           }
 
-          Write-Host "Variable set: $($varset.id)"
-
-          # Locate the release-selection variable.
+          # Locate the normal deployment release-selection variable.
 
           $variables = @(
             Get-HcpCollection `
               -Path "/varsets/$($varset.id)/relationships/vars"
           )
 
-          $releaseVariable = @($variables) |
+          $releaseVariable = $variables |
             Where-Object {
               $_.attributes.key -eq "solution_definitions_release_tag"
             } |
             Select-Object -First 1
 
           if (-not $releaseVariable) {
-            throw "Variable 'solution_definitions_release_tag' was not found in the variable set."
+            throw "Variable 'solution_definitions_release_tag' was not found."
           }
 
-          Write-Host "Current release selection: $($releaseVariable.attributes.value)"
-          Write-Host "Requested release selection: $env:RELEASE_TAG"
-
-          # Update only the variable value.
+          # Override the release selection.
 
           $updateBody = @{
             data = @{
@@ -248,82 +178,97 @@ jobs:
             throw "HCP Terraform did not confirm the requested release selection."
           }
 
-          Write-Host "Variable set release selection updated."
+          Write-Host "Release selection updated to $env:RELEASE_TAG."
 
-          # Explicitly fetch the latest VCS configuration.
-          #
-          # The Stack has trigger-disabled = true, so this explicit
-          # request is the operation that initiates configuration
-          # retrieval. The endpoint returns 204, not a configuration ID.
+          # Capture the current configuration sequence.
+
+          $configurations = @(
+            Get-HcpCollection `
+              -Path "/stacks/$env:HCP_STACK_ID/stack-configurations?page%5Bsize%5D=100"
+          )
+
+          $baselineSequence = 0
+
+          if ($configurations.Count -gt 0) {
+            $baselineConfiguration = $configurations |
+              Sort-Object {
+                [int]$_.attributes.'sequence-number'
+              } -Descending |
+              Select-Object -First 1
+
+            $baselineSequence = [int]$baselineConfiguration.attributes.'sequence-number'
+          }
+
+          Write-Host "Baseline configuration sequence: $baselineSequence"
+
+          # Trigger VCS ingestion from the configured branch.
 
           $fetchStartedAt = [DateTimeOffset]::UtcNow
 
-          $fetchResponse = Invoke-WebRequest `
+          $fetch = Invoke-WebRequest `
             -Method POST `
             -Uri "$api/stacks/$env:HCP_STACK_ID/fetch-latest-from-vcs" `
             -Headers $headers `
             -ContentType "application/vnd.api+json" `
             -ErrorAction Stop
 
-          if ($fetchResponse.StatusCode -ne 204) {
-            throw "VCS fetch returned unexpected HTTP status '$($fetchResponse.StatusCode)'."
+          if ($fetch.StatusCode -ne 204) {
+            throw "Unexpected VCS fetch response: $($fetch.StatusCode)"
           }
 
-          Write-Host "HCP Terraform accepted the VCS fetch request."
+          Write-Host "VCS fetch accepted."
 
-          # Identify the newly created configuration by its sequence
-          # number relative to the supplied baseline.
+          # Discover the configuration created by this fetch.
 
-          $configurationDeadline = [DateTimeOffset]::UtcNow.AddMinutes(10)
-          $executionConfiguration = $null
+          $deadline = [DateTimeOffset]::UtcNow.AddMinutes(10)
+          $configuration = $null
 
-          while ([DateTimeOffset]::UtcNow -lt $configurationDeadline) {
+          while ([DateTimeOffset]::UtcNow -lt $deadline) {
             $configurations = @(
               Get-HcpCollection `
                 -Path "/stacks/$env:HCP_STACK_ID/stack-configurations?page%5Bsize%5D=100"
             )
 
-            $executionConfiguration = @($configurations) |
+            $configuration = $configurations |
               Where-Object {
                 [int]$_.attributes.'sequence-number' -gt $baselineSequence -and
                 [DateTimeOffset]::Parse($_.attributes.'created-at') -ge $fetchStartedAt.AddMinutes(-1)
               } |
-              Sort-Object { [int]$_.attributes.'sequence-number' } -Descending |
+              Sort-Object {
+                [int]$_.attributes.'sequence-number'
+              } -Descending |
               Select-Object -First 1
 
-            if ($executionConfiguration) {
+            if ($configuration) {
               break
             }
 
-            Write-Host "Waiting for the VCS fetch to create a new Stack configuration."
+            Write-Host "Waiting for a new Stack configuration."
             Start-Sleep -Seconds 10
           }
 
-          if (-not $executionConfiguration) {
-            throw "The VCS fetch did not create a new Stack configuration within 10 minutes."
+          if (-not $configuration) {
+            throw "VCS fetch did not create a new Stack configuration."
           }
 
-          $executionConfigurationId = $executionConfiguration.id
+          $configurationId = $configuration.id
 
-          Write-Host ""
-          Write-Host "Execution configuration:"
-          Write-Host "  ID:       $executionConfigurationId"
-          Write-Host "  Sequence: $($executionConfiguration.attributes.'sequence-number')"
-          Write-Host "  Created:  $($executionConfiguration.attributes.'created-at')"
+          Write-Host "Configuration: $configurationId"
+          Write-Host "Sequence: $($configuration.attributes.'sequence-number')"
 
-          # Wait for HCP to finish preparing this exact configuration.
+          # Wait for configuration preparation.
 
-          $configurationDeadline = [DateTimeOffset]::UtcNow.AddMinutes(10)
+          $deadline = [DateTimeOffset]::UtcNow.AddMinutes(10)
           $configurationStatus = $null
 
-          while ([DateTimeOffset]::UtcNow -lt $configurationDeadline) {
+          while ([DateTimeOffset]::UtcNow -lt $deadline) {
             $detail = Invoke-HcpApi `
               -Method GET `
-              -Path "/stack-configurations/$executionConfigurationId"
+              -Path "/stack-configurations/$configurationId"
 
             $configurationStatus = $detail.data.attributes.status
 
-            Write-Host "Configuration '$executionConfigurationId': $configurationStatus"
+            Write-Host "Configuration status: $configurationStatus"
 
             if ($configurationStatus -eq "completed") {
               break
@@ -335,150 +280,39 @@ jobs:
               "canceled",
               "cancelled"
             )) {
-              throw "Configuration preparation failed with status '$configurationStatus'."
+              throw "Configuration preparation failed: $configurationStatus"
             }
 
             Start-Sleep -Seconds 10
           }
 
           if ($configurationStatus -ne "completed") {
-            throw "Timed out waiting for configuration '$executionConfigurationId' to finish preparing."
+            throw "Timed out waiting for configuration preparation."
           }
 
-          Write-Host "Configuration preparation completed."
+          # Find the normal solutions deployment run.
 
-          "execution_configuration_id=$executionConfigurationId" >> $env:GITHUB_OUTPUT
-
-      - name: Wait for deployment approval and completion
-        id: deployment
-        shell: pwsh
-        env:
-          EXECUTION_CONFIGURATION_ID: ${{ steps.configuration.outputs.execution_configuration_id }}
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          if (-not $env:EXECUTION_CONFIGURATION_ID) {
-            throw "The execution configuration ID was not provided."
-          }
-
-          $api = "https://app.terraform.io/api/v2"
-
-          $headers = @{
-            Authorization = "Bearer $env:HCP_TOKEN"
-            Accept        = "application/vnd.api+json"
-          }
-
-          function Invoke-HcpApi {
-            param(
-              [Parameter(Mandatory)]
-              [string]$Path
-            )
-
-            return Invoke-RestMethod `
-              -Method GET `
-              -Uri "$api$Path" `
-              -Headers $headers `
-              -ErrorAction Stop
-          }
-
-          function Get-HcpCollection {
-            param(
-              [Parameter(Mandatory)]
-              [string]$Path
-            )
-
-            $items = @()
-            $next = $Path
-
-            while ($next) {
-              if ($next -match '^https://') {
-                $uri = $next
-              }
-              else {
-                $uri = "$api$next"
-              }
-
-              $response = Invoke-RestMethod `
-                -Method GET `
-                -Uri $uri `
-                -Headers $headers `
-                -ErrorAction Stop
-
-              $items += @($response.data)
-              $next = $response.links.next
-            }
-
-            return ,$items
-          }
-
-          $configurationId = $env:EXECUTION_CONFIGURATION_ID
-
-          Write-Host "Waiting for deployment associated with configuration '$configurationId'."
-
-          # Retrieve the default deployment group for this configuration.
-
-          $groupDeadline = [DateTimeOffset]::UtcNow.AddMinutes(5)
-          $deploymentGroup = $null
-
-          while ([DateTimeOffset]::UtcNow -lt $groupDeadline) {
-            $groups = @(
-              Get-HcpCollection `
-                -Path "/stack-configurations/$configurationId/stack-deployment-groups"
-            )
-
-            $deploymentGroup = @($groups) |
-              Where-Object {
-                $_.attributes.name -eq "solution_default"
-              } |
-              Select-Object -First 1
-
-            if ($deploymentGroup) {
-              break
-            }
-
-            Write-Host "Waiting for solution_default deployment group."
-            Start-Sleep -Seconds 10
-          }
-
-          if (-not $deploymentGroup) {
-            throw "No solution_default deployment group exists for configuration '$configurationId'."
-          }
-
-          $deploymentGroupId = $deploymentGroup.id
-
-          Write-Host ""
-          Write-Host "Deployment group:"
-          Write-Host "  ID:     $deploymentGroupId"
-          Write-Host "  Name:   $($deploymentGroup.attributes.name)"
-          Write-Host "  Status: $($deploymentGroup.attributes.status)"
-
-          # Retrieve the deployment run belonging to this exact
-          # configuration and deployment group.
-
-          $runDeadline = [DateTimeOffset]::UtcNow.AddMinutes(5)
+          $deadline = [DateTimeOffset]::UtcNow.AddMinutes(10)
           $deploymentRun = $null
 
-          while ([DateTimeOffset]::UtcNow -lt $runDeadline) {
+          while ([DateTimeOffset]::UtcNow -lt $deadline) {
             $runs = @(
               Get-HcpCollection `
-                -Path "/stack-deployment-groups/$deploymentGroupId/stack-deployment-runs"
+                -Path "/stack-configurations/$configurationId/stack-deployment-runs"
             )
 
-            $deploymentRun = @($runs) |
+            $deploymentRun = $runs |
               Where-Object {
                 $_.attributes.deployment -eq "solutions" -and
                 $_.relationships.'stack-configuration'.data.id -eq $configurationId
               } |
-              Sort-Object {
-                [DateTimeOffset]::Parse($_.attributes.'created-at')
-              } -Descending |
               Select-Object -First 1
 
             if ($deploymentRun) {
               break
             }
 
-            Write-Host "Waiting for the solutions deployment run to appear."
+            Write-Host "Waiting for the solutions deployment run."
             Start-Sleep -Seconds 10
           }
 
@@ -486,20 +320,14 @@ jobs:
             throw "No solutions deployment run appeared for configuration '$configurationId'."
           }
 
-          $deploymentRunId = $deploymentRun.id
+          $runId = $deploymentRun.id
 
-          Write-Host ""
-          Write-Host "Deployment run:"
-          Write-Host "  ID:     $deploymentRunId"
-          Write-Host "  Status: $($deploymentRun.attributes.status)"
+          Write-Host "Deployment run: $runId"
 
-          # Do not approve plans here.
-          #
-          # Plans containing changes wait for operator approval in HCP.
-          # The workflow remains active while that approval is pending.
+          # Wait for planning and approve this run.
 
-          $deploymentDeadline = [DateTimeOffset]::UtcNow.AddMinutes(345)
-
+          $deadline = [DateTimeOffset]::UtcNow.AddMinutes(345)
+          $approved = $false
           $failureStatuses = @(
             "failed",
             "errored",
@@ -508,177 +336,43 @@ jobs:
             "cancelled"
           )
 
-          $pendingOperatorStatuses = @(
-            "pre_deploying_pending_operator",
-            "deploying_pending_operator"
-          )
+          while ([DateTimeOffset]::UtcNow -lt $deadline) {
+            $response = Invoke-HcpApi `
+              -Method GET `
+              -Path "/stack-deployment-runs/$runId"
 
-          while ($true) {
-            if ([DateTimeOffset]::UtcNow -ge $deploymentDeadline) {
-              throw "Timed out waiting for deployment run '$deploymentRunId'. Last status: '$($deploymentRun.attributes.status)'."
-            }
+            $status = $response.data.attributes.status
 
-            $runResponse = Invoke-HcpApi `
-              -Path "/stack-deployment-runs/$deploymentRunId"
-
-            $currentRun = $runResponse.data
-            $status = $currentRun.attributes.status
-
-            Write-Host "Deployment run '$deploymentRunId': $status"
+            Write-Host "Deployment run '$runId': $status"
 
             if ($status -eq "succeeded") {
               break
             }
 
             if ($status -in $failureStatuses) {
-              throw "Stack deployment ended with status '$status'."
+              throw "Deployment failed: $status"
             }
 
-            if ($status -in $pendingOperatorStatuses) {
-              Write-Host "Plan requires operator approval in HCP Terraform."
-              Write-Host "Approve the plan in HCP Terraform to allow this workflow to continue."
+            if (
+              -not $approved -and
+              $status -in @(
+                "pre_deploying_pending_operator",
+                "deploying_pending_operator"
+              )
+            ) {
+              $null = Invoke-HcpApi `
+                -Method POST `
+                -Path "/stack-deployment-runs/$runId/approve-all-plans"
+
+              $approved = $true
+              Write-Host "Approved deployment run '$runId'."
             }
 
             Start-Sleep -Seconds 20
           }
 
-          Write-Host ""
-          Write-Host "Stack deployment succeeded."
-
-          # Retrieve the Stack's latest aggregated output summary.
-          # This happens only after the deployment run succeeds.
-
-          $outputPath = Join-Path $env:GITHUB_WORKSPACE "solution-variety-topology.json"
-
-          Invoke-WebRequest `
-            -Uri "$api/stacks/$env:HCP_STACK_ID/latest-output-summary" `
-            -Headers $headers `
-            -OutFile $outputPath `
-            -ErrorAction Stop
-
-          if (-not (Test-Path $outputPath) -or (Get-Item $outputPath).Length -eq 0) {
-            throw "The Stack output summary was empty or was not created."
+          if ($status -ne "succeeded") {
+            throw "Timed out waiting for deployment run '$runId'. Last status: $status"
           }
 
-          $outputs = Get-Content $outputPath -Raw | ConvertFrom-Json -Depth 100
-
-          Write-Host ""
-          Write-Host "Retrieved Stack output summary:"
-          $outputs | ConvertTo-Json -Depth 100 | Write-Host
-
-          "deployment_group_id=$deploymentGroupId" >> $env:GITHUB_OUTPUT
-          "deployment_run_id=$deploymentRunId" >> $env:GITHUB_OUTPUT
-
-      - name: Upload Stack output summary
-        uses: actions/upload-artifact@v7.0.2
-        with:
-          name: solution-variety-topology
-          path: solution-variety-topology.json
-          if-no-files-found: error
-          retention-days: 7
-
-  attest:
-    name: Attest solution variety topology
-    runs-on: ubuntu-latest
-    needs: actualize
-    timeout-minutes: 15
-
-    permissions:
-      contents: read
-      id-token: write
-      attestations: write
-      artifact-metadata: write
-
-    env:
-      EXPECTED_RELEASE_TAG: ${{ inputs.solution_definitions_release_tag }}
-
-    steps:
-      - name: Download Stack output summary
-        uses: actions/download-artifact@v8.0.2
-        with:
-          name: solution-variety-topology
-          path: topology
-
-      - name: Generate solution predicate
-        id: predicate
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-
-          $artifactPath = Join-Path $env:GITHUB_WORKSPACE "topology/solution-variety-topology.json"
-          $outputPath = Join-Path $env:GITHUB_WORKSPACE "attestations"
-
-          if (-not (Test-Path $artifactPath)) {
-            throw "Stack topology artifact was not found."
-          }
-
-          $summary = Get-Content $artifactPath -Raw | ConvertFrom-Json -Depth 100
-
-          $solution = $summary.published_outputs.solution_variety_topology.value
-
-          if (-not $solution) {
-            throw "The solution_variety_topology Stack output was not found."
-          }
-
-          if (-not $solution.definition_release) {
-            throw "The topology does not contain a definition release."
-          }
-
-          if ($solution.definition_release -cne $env:EXPECTED_RELEASE_TAG) {
-            throw "Actualized release '$($solution.definition_release)' does not match selected release '$env:EXPECTED_RELEASE_TAG'."
-          }
-
-          if ($solution.definition_release -notmatch '^v\d+\.\d+\.\d+-([A-Za-z0-9]+)$') {
-            throw "Definition release '$($solution.definition_release)' does not follow the expected release tag format."
-          }
-
-          $solutionName = $Matches[1]
-          $subjectName = "amiasea-$solutionName"
-
-          if ($null -eq $solution.varieties) {
-            throw "The topology does not contain a varieties object."
-          }
-
-          New-Item -ItemType Directory -Path $outputPath -Force | Out-Null
-
-          $subjectBytes = [System.Text.Encoding]::UTF8.GetBytes($subjectName)
-          $subjectHash = [System.Security.Cryptography.SHA256]::HashData($subjectBytes)
-          $subjectDigest = "sha256:$([Convert]::ToHexString($subjectHash).ToLowerInvariant())"
-
-          $predicate = [ordered]@{
-            definition = [ordered]@{
-              organization = "amiasea"
-              solution     = $solutionName
-              tag          = $solution.definition_release
-            }
-
-            varieties = $solution.varieties
-          }
-
-          $predicatePath = Join-Path $outputPath "solution-predicate.json"
-
-          $predicate |
-            ConvertTo-Json -Depth 100 |
-            Set-Content -Path $predicatePath -Encoding utf8
-
-          "subject_name=$subjectName" >> $env:GITHUB_OUTPUT
-          "subject_digest=$subjectDigest" >> $env:GITHUB_OUTPUT
-          "predicate_path=$predicatePath" >> $env:GITHUB_OUTPUT
-
-          Write-Host "Prepared solution predicate for $subjectName."
-          Write-Host "Definition release: $($solution.definition_release)"
-          Write-Host "Variety count: $($solution.varieties.PSObject.Properties.Count)"
-
-      - name: Create signed solution attestation
-        uses: actions/attest@v4.2.2
-        with:
-          subject-name: ${{ steps.predicate.outputs.subject_name }}
-          subject-digest: ${{ steps.predicate.outputs.subject_digest }}
-          predicate-type: https://amiasea.dev/attestation/variety/v1
-          predicate-path: ${{ steps.predicate.outputs.predicate_path }}
-
-      - name: Create signed SLSA provenance attestation
-        uses: actions/attest@v4.2.2
-        with:
-          subject-name: ${{ steps.predicate.outputs.subject_name }}
-          subject-digest: ${{ steps.predicate.outputs.subject_digest }}
+          Write-Host "Enterprise solution actualization succeeded."
