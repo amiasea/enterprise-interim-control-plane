@@ -95,8 +95,11 @@ jobs:
               ErrorAction = "Stop"
             }
 
-            if ($null -ne $Body) {
+            if ($Method -in @("PATCH", "POST")) {
               $parameters.ContentType = "application/vnd.api+json"
+            }
+
+            if ($null -ne $Body) {
               $parameters.Body = $Body | ConvertTo-Json -Depth 20 -Compress
             }
 
