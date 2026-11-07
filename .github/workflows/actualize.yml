@@ -141,7 +141,7 @@ jobs:
             throw "Variable set 'enterprise-solution-actualization' was not found."
           }
 
-          # Locate the normal deployment release-selection variable.
+          # Locate or create the normal deployment release-selection variable.
 
           $variables = @(
             Get-HcpCollection `
@@ -154,31 +154,55 @@ jobs:
             } |
             Select-Object -First 1
 
-          if (-not $releaseVariable) {
-            throw "Variable 'solution_definitions_release_tag' was not found."
-          }
+          if ($releaseVariable) {
+            Write-Host "Updating existing release-selection variable."
 
-          # Override the release selection.
-
-          $updateBody = @{
-            data = @{
-              type = "vars"
-              attributes = @{
-                value = $env:RELEASE_TAG
+            $updateBody = @{
+              data = @{
+                type = "vars"
+                attributes = @{
+                  value = $env:RELEASE_TAG
+                }
               }
             }
+
+            $updatedVariable = Invoke-HcpApi `
+              -Method PATCH `
+              -Path "/varsets/$($varset.id)/relationships/vars/$($releaseVariable.id)" `
+              -Body $updateBody
+          }
+          else {
+            Write-Host "Creating initial release-selection variable."
+
+            $createBody = @{
+              data = @{
+                type = "vars"
+                attributes = @{
+                  key         = "solution_definitions_release_tag"
+                  value       = $env:RELEASE_TAG
+                  category    = "terraform"
+                  hcl         = $false
+                  sensitive   = $false
+                  description = "Solution Definitions release used for normal solution actualization."
+                }
+              }
+            }
+
+            $updatedVariable = Invoke-HcpApi `
+              -Method POST `
+              -Path "/varsets/$($varset.id)/relationships/vars" `
+              -Body $createBody
           }
 
-          $updatedVariable = Invoke-HcpApi `
-            -Method PATCH `
-            -Path "/varsets/$($varset.id)/relationships/vars/$($releaseVariable.id)" `
-            -Body $updateBody
+          if ($updatedVariable.data.attributes.key -ne "solution_definitions_release_tag") {
+            throw "HCP Terraform did not confirm the release-selection variable."
+          }
 
           if ($updatedVariable.data.attributes.value -cne $env:RELEASE_TAG) {
             throw "HCP Terraform did not confirm the requested release selection."
           }
 
-          Write-Host "Release selection updated to $env:RELEASE_TAG."
+          Write-Host "Release selection is $env:RELEASE_TAG."
 
           # Capture the current configuration sequence.
 
