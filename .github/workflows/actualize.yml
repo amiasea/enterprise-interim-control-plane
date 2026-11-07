@@ -84,8 +84,12 @@ jobs:
               [object]$Body
             )
 
+            $uri = "$api$Path"
+
+            Write-Host "HCP API request: $Method $uri"
+
             $parameters = @{
-              Uri         = "$api$Path"
+              Uri         = $uri
               Method      = $Method
               Headers     = $headers
               ErrorAction = "Stop"
@@ -96,7 +100,67 @@ jobs:
               $parameters.Body = $Body | ConvertTo-Json -Depth 20 -Compress
             }
 
-            Invoke-RestMethod @parameters
+            try {
+              $response = Invoke-RestMethod @parameters
+              Write-Host "HCP API response: success ($Method $Path)"
+              return $response
+            }
+            catch {
+              $exception = $_.Exception
+              $statusCode = $null
+              $responseBody = $null
+
+              if ($null -ne $exception.Response) {
+                try {
+                  $statusCode = [int]$exception.Response.StatusCode
+                }
+                catch {
+                  $statusCode = "unknown"
+                }
+
+                if ($exception.Response.Content) {
+                  try {
+                    $responseBody = $exception.Response.Content.
+                      ReadAsStringAsync().
+                      GetAwaiter().
+                      GetResult()
+                  }
+                  catch {
+                    $responseBody = "Unable to read HTTP response content."
+                  }
+                }
+                elseif ($exception.Response.GetResponseStream) {
+                  try {
+                    $reader = [System.IO.StreamReader]::new(
+                      $exception.Response.GetResponseStream()
+                    )
+                    $responseBody = $reader.ReadToEnd()
+                    $reader.Dispose()
+                  }
+                  catch {
+                    $responseBody = "Unable to read HTTP response stream."
+                  }
+                }
+              }
+
+              if (-not $responseBody -and $_.ErrorDetails.Message) {
+                $responseBody = $_.ErrorDetails.Message
+              }
+
+              Write-Host "::error::HCP API request failed."
+              Write-Host "HTTP method: $Method"
+              Write-Host "Request URL: $uri"
+              Write-Host "HTTP status: $statusCode"
+
+              if ($responseBody) {
+                Write-Host "Response body:"
+                Write-Host $responseBody
+              }
+
+              Write-Host "PowerShell exception: $($exception.Message)"
+
+              throw
+            }
           }
 
           function Get-HcpCollection {
@@ -107,8 +171,12 @@ jobs:
 
             $items = @()
             $next = $Path
+            $page = 0
 
             while ($next) {
+              $page++
+              Write-Host "Retrieving collection page $page."
+
               $response = Invoke-HcpApi -Method GET -Path $next
               $items += @($response.data)
               $next = $response.links.next
@@ -118,6 +186,7 @@ jobs:
               }
             }
 
+            Write-Host "Collection returned $($items.Count) resource(s)."
             return ,$items
           }
 
@@ -126,10 +195,19 @@ jobs:
 
           # Locate the actualization variable set.
 
+          $varsetPath = "/organizations/amiasea/varsets?q=enterprise-solution-actualization"
+
+          Write-Host "Searching for variable set: enterprise-solution-actualization"
+
           $varsets = @(
-            Get-HcpCollection `
-              -Path "/organizations/amiasea/varsets?q=enterprise-solution-actualization"
+            Get-HcpCollection -Path $varsetPath
           )
+
+          Write-Host "Matching variable sets returned: $($varsets.Count)"
+
+          foreach ($candidate in $varsets) {
+            Write-Host "Variable set candidate: name='$($candidate.attributes.name)', id='$($candidate.id)'"
+          }
 
           $varset = $varsets |
             Where-Object {
@@ -141,12 +219,26 @@ jobs:
             throw "Variable set 'enterprise-solution-actualization' was not found."
           }
 
+          Write-Host "Selected variable set:"
+          Write-Host "  Name: $($varset.attributes.name)"
+          Write-Host "  ID: $($varset.id)"
+          Write-Host "  Organization relationship: $($varset.relationships.organization.data.id)"
+
           # Locate or create the normal deployment release-selection variable.
 
+          $variablesPath = "/varsets/$($varset.id)/relationships/vars"
+
+          Write-Host "Retrieving variables for variable set '$($varset.id)'."
+
           $variables = @(
-            Get-HcpCollection `
-              -Path "/varsets/$($varset.id)/relationships/vars"
+            Get-HcpCollection -Path $variablesPath
           )
+
+          Write-Host "Variables returned: $($variables.Count)"
+
+          foreach ($variable in $variables) {
+            Write-Host "Variable candidate: key='$($variable.attributes.key)', id='$($variable.id)'"
+          }
 
           $releaseVariable = $variables |
             Where-Object {
@@ -155,7 +247,19 @@ jobs:
             Select-Object -First 1
 
           if ($releaseVariable) {
+            Write-Host "Found existing release-selection variable."
+            Write-Host "  Variable ID: $($releaseVariable.id)"
+            Write-Host "  Variable key: $($releaseVariable.attributes.key)"
+            Write-Host "  Current value: $($releaseVariable.attributes.value)"
+            Write-Host "  Category: $($releaseVariable.attributes.category)"
+            Write-Host "  HCL: $($releaseVariable.attributes.hcl)"
+            Write-Host "  Sensitive: $($releaseVariable.attributes.sensitive)"
+            Write-Host "  Variable set ID: $($varset.id)"
+
+            $updatePath = "/varsets/$($varset.id)/relationships/vars/$($releaseVariable.id)"
+
             Write-Host "Updating existing release-selection variable."
+            Write-Host "PATCH endpoint: $api$updatePath"
 
             $updateBody = @{
               data = @{
@@ -166,13 +270,20 @@ jobs:
               }
             }
 
+            Write-Host "PATCH payload:"
+            Write-Host ($updateBody | ConvertTo-Json -Depth 20)
+
             $updatedVariable = Invoke-HcpApi `
               -Method PATCH `
-              -Path "/varsets/$($varset.id)/relationships/vars/$($releaseVariable.id)" `
+              -Path $updatePath `
               -Body $updateBody
           }
           else {
             Write-Host "Creating initial release-selection variable."
+
+            $createPath = "/varsets/$($varset.id)/relationships/vars"
+
+            Write-Host "POST endpoint: $api$createPath"
 
             $createBody = @{
               data = @{
@@ -188,11 +299,17 @@ jobs:
               }
             }
 
+            Write-Host "POST payload:"
+            Write-Host ($createBody | ConvertTo-Json -Depth 20)
+
             $updatedVariable = Invoke-HcpApi `
               -Method POST `
-              -Path "/varsets/$($varset.id)/relationships/vars" `
+              -Path $createPath `
               -Body $createBody
           }
+
+          Write-Host "Variable write response:"
+          Write-Host ($updatedVariable | ConvertTo-Json -Depth 20)
 
           if ($updatedVariable.data.attributes.key -ne "solution_definitions_release_tag") {
             throw "HCP Terraform did not confirm the release-selection variable."
@@ -229,12 +346,16 @@ jobs:
 
           $fetchStartedAt = [DateTimeOffset]::UtcNow
 
+          Write-Host "Triggering VCS fetch for Stack '$env:HCP_STACK_ID'."
+
           $fetch = Invoke-WebRequest `
             -Method POST `
             -Uri "$api/stacks/$env:HCP_STACK_ID/fetch-latest-from-vcs" `
             -Headers $headers `
             -ContentType "application/vnd.api+json" `
             -ErrorAction Stop
+
+          Write-Host "VCS fetch HTTP status: $($fetch.StatusCode)"
 
           if ($fetch.StatusCode -notin @(200, 204)) {
             throw "Unexpected VCS fetch response: $($fetch.StatusCode)"
