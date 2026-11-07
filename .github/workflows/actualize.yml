@@ -187,7 +187,7 @@ jobs:
             }
 
             Write-Host "Collection returned $($items.Count) resource(s)."
-            return ,$items
+            return $items
           }
 
           Write-Host "Stack: $env:HCP_STACK_ID"
