@@ -236,7 +236,7 @@ jobs:
             -ContentType "application/vnd.api+json" `
             -ErrorAction Stop
 
-          if ($fetch.StatusCode -ne 204) {
+          if ($fetch.StatusCode -notin @(200, 204)) {
             throw "Unexpected VCS fetch response: $($fetch.StatusCode)"
           }
 
