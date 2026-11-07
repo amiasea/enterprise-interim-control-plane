@@ -501,10 +501,12 @@ jobs:
             if (
               -not $approved -and
               $status -in @(
-                "pre_deploying_pending_operator",
-                "deploying_pending_operator"
+                "pre-deploying-pending-operator",
+                "deploying-pending-operator"
               )
             ) {
+              Write-Host "Deployment run requires operator approval. Approving..."
+
               $null = Invoke-HcpApi `
                 -Method POST `
                 -Path "/stack-deployment-runs/$runId/approve-all-plans"
