@@ -435,7 +435,7 @@ jobs:
             throw "Timed out waiting for configuration preparation."
           }
 
-          # Find the normal solutions deployment run.
+          # Find the normal solution deployment run.
 
           $deadline = [DateTimeOffset]::UtcNow.AddMinutes(10)
           $deploymentRun = $null
@@ -448,7 +448,7 @@ jobs:
 
             $deploymentRun = $runs |
               Where-Object {
-                $_.attributes.deployment -eq "solutions" -and
+                $_.attributes.deployment -eq "solution" -and
                 $_.relationships.'stack-configuration'.data.id -eq $configurationId
               } |
               Select-Object -First 1
@@ -457,12 +457,12 @@ jobs:
               break
             }
 
-            Write-Host "Waiting for the solutions deployment run."
+            Write-Host "Waiting for the solution deployment run."
             Start-Sleep -Seconds 10
           }
 
           if (-not $deploymentRun) {
-            throw "No solutions deployment run appeared for configuration '$configurationId'."
+            throw "No solution deployment run appeared for configuration '$configurationId'."
           }
 
           $runId = $deploymentRun.id
