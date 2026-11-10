@@ -1,10 +1,10 @@
-name: Actualize Enterprise Pomology
+name: Propagate Enterprise Pomology
 
 on:
   workflow_dispatch:
     inputs:
-      pomology_definitions_release_tag:
-        description: Pomology Definitions release tag
+      pomology_flora_release_tag:
+        description: Pomology Flora release tag
         required: true
         type: string
 
@@ -13,15 +13,15 @@ permissions:
   id-token: write
 
 jobs:
-  actualize:
-    name: Actualize enterprise pomology
+  propagate:
+    name: Propagate enterprise pomology
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
     env:
-      HCP_STACK_ID: ${{ vars.POMOLOGY_ACTUALIZATION_STACK_ID }}
+      HCP_STACK_ID: ${{ vars.POMOLOGY_PROPAGATION_STACK_ID }}
       HCP_TOKEN_SECRET_ID: ${{ vars.AMIASEA_TFE_TOKEN_VERSIONLESS_ID }}
-      RELEASE_TAG: ${{ inputs.pomology_definitions_release_tag }}
+      RELEASE_TAG: ${{ inputs.pomology_flora_release_tag }}
 
     steps:
       - name: Authenticate to Azure
@@ -52,7 +52,7 @@ jobs:
           Write-Output "::add-mask::$token"
           "HCP_TOKEN=$token" >> $env:GITHUB_ENV
 
-      - name: Actualize
+      - name: Propagate
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
@@ -62,7 +62,7 @@ jobs:
           }
 
           if ($env:RELEASE_TAG -notmatch '^v\d+\.\d+\.\d+-[A-Za-z0-9]+$') {
-            throw "Invalid Pomology Definitions release tag: $env:RELEASE_TAG"
+            throw "Invalid Pomology Flora release tag: $env:RELEASE_TAG"
           }
 
           $api = "https://app.terraform.io/api/v2"
@@ -194,7 +194,7 @@ jobs:
           }
 
           Write-Host "Stack: $env:HCP_STACK_ID"
-          Write-Host "Pomology Definitions release: $env:RELEASE_TAG"
+          Write-Host "Pomology Flora release: $env:RELEASE_TAG"
 
           # Locate the actualization variable set.
 
@@ -245,7 +245,7 @@ jobs:
 
           $releaseVariable = $variables |
             Where-Object {
-              $_.attributes.key -eq "pomology_definitions_release_tag"
+              $_.attributes.key -eq "pomology_flora_release_tag"
             } |
             Select-Object -First 1
 
@@ -292,12 +292,12 @@ jobs:
               data = @{
                 type = "vars"
                 attributes = @{
-                  key         = "pomology_definitions_release_tag"
+                  key         = "pomology_flora_release_tag"
                   value       = $env:RELEASE_TAG
                   category    = "terraform"
                   hcl         = $false
                   sensitive   = $false
-                  description = "Pomology Definitions release used for normal pomology actualization."
+                  description = "Pomology Flora release used for normal pomology actualization."
                 }
               }
             }
@@ -314,7 +314,7 @@ jobs:
           Write-Host "Variable write response:"
           Write-Host ($updatedVariable | ConvertTo-Json -Depth 20)
 
-          if ($updatedVariable.data.attributes.key -ne "pomology_definitions_release_tag") {
+          if ($updatedVariable.data.attributes.key -ne "pomology_flora_release_tag") {
             throw "HCP Terraform did not confirm the release-selection variable."
           }
 
