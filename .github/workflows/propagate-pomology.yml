@@ -196,11 +196,11 @@ jobs:
           Write-Host "Stack: $env:HCP_STACK_ID"
           Write-Host "Pomology Flora release: $env:RELEASE_TAG"
 
-          # Locate the actualization variable set.
+          # Locate the propagation variable set.
 
-          $varsetPath = "/organizations/amiasea/varsets?q=enterprise-pomology-actualization"
+          $varsetPath = "/organizations/amiasea/varsets?q=enterprise-pomology-propagation"
 
-          Write-Host "Searching for variable set: enterprise-pomology-actualization"
+          Write-Host "Searching for variable set: enterprise-pomology-propagation"
 
           $varsets = @(
             Get-HcpCollection -Path $varsetPath
@@ -214,12 +214,12 @@ jobs:
 
           $varset = $varsets |
             Where-Object {
-              $_.attributes.name -eq "enterprise-pomology-actualization"
+              $_.attributes.name -eq "enterprise-pomology-propagation"
             } |
             Select-Object -First 1
 
           if (-not $varset) {
-            throw "Variable set 'enterprise-pomology-actualization' was not found."
+            throw "Variable set 'enterprise-pomology-propagation' was not found."
           }
 
           Write-Host "Selected variable set:"
@@ -297,7 +297,7 @@ jobs:
                   category    = "terraform"
                   hcl         = $false
                   sensitive   = $false
-                  description = "Pomology Flora release used for normal pomology actualization."
+                  description = "Pomology Flora release used for normal pomology propagation."
                 }
               }
             }
@@ -525,4 +525,4 @@ jobs:
             throw "Timed out waiting for deployment run '$runId'. Last status: $status"
           }
 
-          Write-Host "Enterprise pomology actualization succeeded."
+          Write-Host "Enterprise pomology propagation succeeded."
