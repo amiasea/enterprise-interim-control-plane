@@ -62,89 +62,108 @@ jobs:
             throw "Stack ID or HCP Terraform token is missing."
           }
 
-          # Validate the pruning selection.
+          # Validate the pruning selection as JSON.
+
+          $jsonDocument = $null
 
           try {
-            $pomologyVarieties = @(
-              ConvertFrom-Json `
-                -InputObject $env:POMOLOGY_VARIETIES_JSON `
-                -AsHashtable `
-                -NoEnumerate `
-                -ErrorAction Stop
+            $jsonDocument = [System.Text.Json.JsonDocument]::Parse(
+              $env:POMOLOGY_VARIETIES_JSON
             )
+
+            if ($jsonDocument.RootElement.ValueKind -ne [System.Text.Json.JsonValueKind]::Array) {
+              throw "pomology_varieties must be a JSON array."
+            }
+
+            $repoPrefixes = [System.Collections.Generic.HashSet[string]]::new(
+              [System.StringComparer]::OrdinalIgnoreCase
+            )
+
+            $selectionCount = 0
+
+            foreach ($selection in $jsonDocument.RootElement.EnumerateArray()) {
+              $selectionCount++
+
+              if ($selection.ValueKind -ne [System.Text.Json.JsonValueKind]::Object) {
+                throw "Each pomology_varieties entry must be a JSON object."
+              }
+
+              $properties = @{}
+
+              foreach ($property in $selection.EnumerateObject()) {
+                if ($property.Name -notin @("repo_prefix", "variety")) {
+                  throw "Unexpected selection property: $($property.Name)"
+                }
+
+                if ($properties.ContainsKey($property.Name)) {
+                  throw "Duplicate selection property: $($property.Name)"
+                }
+
+                $properties[$property.Name] = $property.Value
+              }
+
+              if (
+                -not $properties.ContainsKey("repo_prefix") -or
+                $properties["repo_prefix"].ValueKind -ne [System.Text.Json.JsonValueKind]::String
+              ) {
+                throw "Every selection must have a string repo_prefix."
+              }
+
+              $repoPrefix = $properties["repo_prefix"].GetString()
+
+              if ([string]::IsNullOrWhiteSpace($repoPrefix)) {
+                throw "Every selection must have a non-empty repo_prefix."
+              }
+
+              if (-not $repoPrefixes.Add($repoPrefix)) {
+                throw "Duplicate repo_prefix: $repoPrefix"
+              }
+
+              if (
+                $properties.ContainsKey("variety") -and
+                $properties["variety"].ValueKind -notin @(
+                  [System.Text.Json.JsonValueKind]::String,
+                  [System.Text.Json.JsonValueKind]::Null
+                )
+              ) {
+                throw "Variety for '$repoPrefix' must be a string or null."
+              }
+
+              $variety = "<omitted>"
+
+              if ($properties.ContainsKey("variety")) {
+                $varietyElement = $properties["variety"]
+
+                $variety = if (
+                  $varietyElement.ValueKind -eq [System.Text.Json.JsonValueKind]::Null
+                ) {
+                  "<null>"
+                }
+                elseif ($varietyElement.GetString() -eq "") {
+                  "<blank>"
+                }
+                else {
+                  $varietyElement.GetString()
+                }
+              }
+
+              Write-Host "Pomology: repo_prefix='$repoPrefix', variety='$variety'"
+            }
+
+            Write-Host "Validated $selectionCount Pomology selection(s)."
           }
           catch {
             throw "Invalid pomology_varieties JSON: $($_.Exception.Message)"
           }
-
-          if (
-            $env:POMOLOGY_VARIETIES_JSON.TrimStart()[0] -ne '['
-          ) {
-            throw "pomology_varieties must be a JSON array."
-          }
-
-          $repoPrefixes = [System.Collections.Generic.HashSet[string]]::new(
-            [System.StringComparer]::OrdinalIgnoreCase
-          )
-
-          foreach ($selection in $pomologyVarieties) {
-            if ($null -eq $selection -or
-                -not ($selection -is [System.Collections.IDictionary])) {
-              throw "Each pomology_varieties entry must be a JSON object."
-            }
-
-            $unexpectedKeys = @(
-              $selection.Keys |
-                Where-Object { $_ -notin @("repo_prefix", "variety") }
-            )
-
-            if ($unexpectedKeys.Count -gt 0) {
-              throw "Unexpected selection properties: $($unexpectedKeys -join ', ')"
-            }
-
-            if (
-              -not $selection.Contains("repo_prefix") -or
-              $selection.repo_prefix -isnot [string] -or
-              [string]::IsNullOrWhiteSpace($selection.repo_prefix)
-            ) {
-              throw "Every selection must have a non-empty repo_prefix."
-            }
-
-            if (-not $repoPrefixes.Add($selection.repo_prefix)) {
-              throw "Duplicate repo_prefix: $($selection.repo_prefix)"
-            }
-
-            if (
-              $selection.Contains("variety") -and
-              $null -ne $selection.variety -and
-              $selection.variety -isnot [string]
-            ) {
-              throw "Variety for '$($selection.repo_prefix)' must be a string or null."
+          finally {
+            if ($null -ne $jsonDocument) {
+              $jsonDocument.Dispose()
             }
           }
 
-          $pomologyVarietiesJson = ConvertTo-Json `
-            -InputObject @($pomologyVarieties) `
-            -Depth 20 `
-            -Compress
+          # Preserve the original JSON supplied by the workflow input.
 
-          Write-Host "Validated $($pomologyVarieties.Count) Pomology selection(s)."
-
-          foreach ($selection in $pomologyVarieties) {
-            $variety = if (
-              $null -eq $selection.variety
-            ) {
-              "<null>"
-            }
-            elseif ($selection.variety -eq "") {
-              "<blank>"
-            }
-            else {
-              $selection.variety
-            }
-
-            Write-Host "Pomology: repo_prefix='$($selection.repo_prefix)', variety='$variety'"
-          }
+          $pomologyVarietiesJson = $env:POMOLOGY_VARIETIES_JSON
 
           $api = "https://app.terraform.io/api/v2"
 
@@ -275,7 +294,7 @@ jobs:
           }
 
           Write-Host "Stack: $env:HCP_STACK_ID"
-          Write-Host "Pomology selections: $($pomologyVarieties.Count)"
+          Write-Host "Pomology selections: $selectionCount"
 
           # Locate the pruning variable set.
 
