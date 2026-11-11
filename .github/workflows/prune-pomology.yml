@@ -65,16 +65,21 @@ jobs:
           # Validate the pruning selection.
 
           try {
-            $pomologyVarieties = ConvertFrom-Json `
-              -InputObject $env:POMOLOGY_VARIETIES_JSON `
-              -AsHashtable `
-              -ErrorAction Stop
+            $pomologyVarieties = @(
+              ConvertFrom-Json `
+                -InputObject $env:POMOLOGY_VARIETIES_JSON `
+                -AsHashtable `
+                -NoEnumerate `
+                -ErrorAction Stop
+            )
           }
           catch {
             throw "Invalid pomology_varieties JSON: $($_.Exception.Message)"
           }
 
-          if ($pomologyVarieties -isnot [array]) {
+          if (
+            $env:POMOLOGY_VARIETIES_JSON.TrimStart()[0] -ne '['
+          ) {
             throw "pomology_varieties must be a JSON array."
           }
 
