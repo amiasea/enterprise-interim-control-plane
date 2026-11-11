@@ -1,0 +1,603 @@
+
+name: Prune Enterprise Pomology
+
+on:
+  workflow_dispatch:
+    inputs:
+      pomology_varieties:
+        description: 'JSON array of Pomology selections (repo_prefix and optional variety)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  prune:
+    name: Prune enterprise pomology
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    env:
+      HCP_STACK_ID: ${{ vars.POMOLOGY_PRUNING_STACK_ID }}
+      HCP_TOKEN_SECRET_ID: ${{ vars.AMIASEA_TFE_TOKEN_VERSIONLESS_ID }}
+      POMOLOGY_VARIETIES_JSON: ${{ inputs.pomology_varieties }}
+
+    steps:
+      - name: Authenticate to Azure
+        uses: azure/login@v3.1.0
+        with:
+          client-id: ${{ vars.AZURE_INSTITUTIVE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_INSTITUTIVE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_INSTITUTIVE_SUBSCRIPTION_ID }}
+
+      - name: Retrieve HCP Terraform token
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if (-not $env:HCP_TOKEN_SECRET_ID) {
+            throw "AMIASEA_TFE_TOKEN_VERSIONLESS_ID is not configured."
+          }
+
+          $token = az keyvault secret show `
+            --id $env:HCP_TOKEN_SECRET_ID `
+            --query value `
+            --output tsv
+
+          if ($LASTEXITCODE -ne 0 -or -not $token) {
+            throw "Failed to retrieve HCP Terraform token."
+          }
+
+          Write-Output "::add-mask::$token"
+          "HCP_TOKEN=$token" >> $env:GITHUB_ENV
+
+      - name: Prune
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if (-not $env:HCP_STACK_ID -or -not $env:HCP_TOKEN) {
+            throw "Stack ID or HCP Terraform token is missing."
+          }
+
+          # Validate the pruning selection.
+
+          try {
+            $pomologyVarieties = ConvertFrom-Json `
+              -InputObject $env:POMOLOGY_VARIETIES_JSON `
+              -AsHashtable `
+              -ErrorAction Stop
+          }
+          catch {
+            throw "Invalid pomology_varieties JSON: $($_.Exception.Message)"
+          }
+
+          if ($pomologyVarieties -isnot [array]) {
+            throw "pomology_varieties must be a JSON array."
+          }
+
+          $repoPrefixes = [System.Collections.Generic.HashSet[string]]::new(
+            [System.StringComparer]::OrdinalIgnoreCase
+          )
+
+          foreach ($selection in $pomologyVarieties) {
+            if ($selection -isnot [System.Collections.IDictionary]) {
+              throw "Each pomology_varieties entry must be a JSON object."
+            }
+
+            $unexpectedKeys = @(
+              $selection.Keys |
+                Where-Object { $_ -notin @("repo_prefix", "variety") }
+            )
+
+            if ($unexpectedKeys.Count -gt 0) {
+              throw "Unexpected selection properties: $($unexpectedKeys -join ', ')"
+            }
+
+            if (
+              -not $selection.Contains("repo_prefix") -or
+              $selection.repo_prefix -isnot [string] -or
+              [string]::IsNullOrWhiteSpace($selection.repo_prefix)
+            ) {
+              throw "Every selection must have a non-empty repo_prefix."
+            }
+
+            if (-not $repoPrefixes.Add($selection.repo_prefix)) {
+              throw "Duplicate repo_prefix: $($selection.repo_prefix)"
+            }
+
+            if (
+              $selection.Contains("variety") -and
+              $null -ne $selection.variety -and
+              $selection.variety -isnot [string]
+            ) {
+              throw "Variety for '$($selection.repo_prefix)' must be a string or null."
+            }
+          }
+
+          $pomologyVarietiesJson = ConvertTo-Json `
+            -InputObject @($pomologyVarieties) `
+            -Depth 20 `
+            -Compress
+
+          Write-Host "Validated $($pomologyVarieties.Count) Pomology selection(s)."
+
+          foreach ($selection in $pomologyVarieties) {
+            $variety = if (
+              $null -eq $selection.variety
+            ) {
+              "<null>"
+            }
+            elseif ($selection.variety -eq "") {
+              "<blank>"
+            }
+            else {
+              $selection.variety
+            }
+
+            Write-Host "Pomology: repo_prefix='$($selection.repo_prefix)', variety='$variety'"
+          }
+
+          $api = "https://app.terraform.io/api/v2"
+
+          $headers = @{
+            Authorization = "Bearer $env:HCP_TOKEN"
+            Accept        = "application/vnd.api+json"
+          }
+
+          function Invoke-HcpApi {
+            param(
+              [Parameter(Mandatory)]
+              [ValidateSet("GET", "PATCH", "POST")]
+              [string]$Method,
+
+              [Parameter(Mandatory)]
+              [string]$Path,
+
+              [object]$Body
+            )
+
+            $uri = "$api$Path"
+
+            Write-Host "HCP API request: $Method $uri"
+
+            $parameters = @{
+              Uri         = $uri
+              Method      = $Method
+              Headers     = $headers
+              ErrorAction = "Stop"
+            }
+
+            if ($Method -in @("PATCH", "POST")) {
+              $parameters.ContentType = "application/vnd.api+json"
+            }
+
+            if ($null -ne $Body) {
+              $parameters.Body = $Body | ConvertTo-Json -Depth 20 -Compress
+            }
+
+            try {
+              $response = Invoke-RestMethod @parameters
+              Write-Host "HCP API response: success ($Method $Path)"
+              return $response
+            }
+            catch {
+              $exception = $_.Exception
+              $statusCode = $null
+              $responseBody = $null
+
+              if ($null -ne $exception.Response) {
+                try {
+                  $statusCode = [int]$exception.Response.StatusCode
+                }
+                catch {
+                  $statusCode = "unknown"
+                }
+
+                if ($exception.Response.Content) {
+                  try {
+                    $responseBody = $exception.Response.Content.
+                      ReadAsStringAsync().
+                      GetAwaiter().
+                      GetResult()
+                  }
+                  catch {
+                    $responseBody = "Unable to read HTTP response content."
+                  }
+                }
+                elseif ($exception.Response.GetResponseStream) {
+                  try {
+                    $reader = [System.IO.StreamReader]::new(
+                      $exception.Response.GetResponseStream()
+                    )
+                    $responseBody = $reader.ReadToEnd()
+                    $reader.Dispose()
+                  }
+                  catch {
+                    $responseBody = "Unable to read HTTP response stream."
+                  }
+                }
+              }
+
+              if (-not $responseBody -and $_.ErrorDetails.Message) {
+                $responseBody = $_.ErrorDetails.Message
+              }
+
+              Write-Host "::error::HCP API request failed."
+              Write-Host "HTTP method: $Method"
+              Write-Host "Request URL: $uri"
+              Write-Host "HTTP status: $statusCode"
+
+              if ($responseBody) {
+                Write-Host "Response body:"
+                Write-Host $responseBody
+              }
+
+              Write-Host "PowerShell exception: $($exception.Message)"
+
+              throw
+            }
+          }
+
+          function Get-HcpCollection {
+            param(
+              [Parameter(Mandatory)]
+              [string]$Path
+            )
+
+            $items = @()
+            $next = $Path
+            $page = 0
+
+            while ($next) {
+              $page++
+              Write-Host "Retrieving collection page $page."
+
+              $response = Invoke-HcpApi -Method GET -Path $next
+              $items += @($response.data)
+              $next = $response.links.next
+
+              if ($next -match '^https://') {
+                $next = $next -replace '^https://app\.terraform\.io/api/v2', ''
+              }
+            }
+
+            Write-Host "Collection returned $($items.Count) resource(s)."
+            return $items
+          }
+
+          Write-Host "Stack: $env:HCP_STACK_ID"
+          Write-Host "Pomology selections: $($pomologyVarieties.Count)"
+
+          # Locate the pruning variable set.
+
+          $varsetPath = "/organizations/amiasea/varsets?q=enterprise-pomology-pruning"
+
+          Write-Host "Searching for variable set: enterprise-pomology-pruning"
+
+          $varsets = @(
+            Get-HcpCollection -Path $varsetPath
+          )
+
+          Write-Host "Matching variable sets returned: $($varsets.Count)"
+
+          foreach ($candidate in $varsets) {
+            Write-Host "Variable set candidate: name='$($candidate.attributes.name)', id='$($candidate.id)'"
+          }
+
+          $varset = $varsets |
+            Where-Object {
+              $_.attributes.name -eq "enterprise-pomology-pruning"
+            } |
+            Select-Object -First 1
+
+          if (-not $varset) {
+            throw "Variable set 'enterprise-pomology-pruning' was not found."
+          }
+
+          Write-Host "Selected variable set:"
+          Write-Host "  Name: $($varset.attributes.name)"
+          Write-Host "  ID: $($varset.id)"
+          Write-Host "  Organization relationship: $($varset.relationships.organization.data.id)"
+
+          # Locate or create the pruning selection variable.
+
+          $variablesPath = "/varsets/$($varset.id)/relationships/vars"
+
+          Write-Host "Retrieving variables for variable set '$($varset.id)'."
+
+          $variables = @(
+            Get-HcpCollection -Path $variablesPath
+          )
+
+          Write-Host "Variables returned: $($variables.Count)"
+
+          foreach ($variable in $variables) {
+            Write-Host "Variable candidate: key='$($variable.attributes.key)', id='$($variable.id)'"
+          }
+
+          $pomologyVariable = $variables |
+            Where-Object {
+              $_.attributes.key -eq "pomology_varieties"
+            } |
+            Select-Object -First 1
+
+          if ($pomologyVariable) {
+            Write-Host "Found existing pruning selection variable."
+            Write-Host "  Variable ID: $($pomologyVariable.id)"
+            Write-Host "  Variable key: $($pomologyVariable.attributes.key)"
+            Write-Host "  Category: $($pomologyVariable.attributes.category)"
+            Write-Host "  HCL: $($pomologyVariable.attributes.hcl)"
+            Write-Host "  Sensitive: $($pomologyVariable.attributes.sensitive)"
+            Write-Host "  Variable set ID: $($varset.id)"
+
+            $updatePath = "/varsets/$($varset.id)/relationships/vars/$($pomologyVariable.id)"
+
+            Write-Host "Updating existing pruning selection variable."
+            Write-Host "PATCH endpoint: $api$updatePath"
+
+            $updateBody = @{
+              data = @{
+                type = "vars"
+                attributes = @{
+                  value = $pomologyVarietiesJson
+                  hcl   = $true
+                }
+              }
+            }
+
+            Write-Host "PATCH payload:"
+            Write-Host ($updateBody | ConvertTo-Json -Depth 20)
+
+            $updatedVariable = Invoke-HcpApi `
+              -Method PATCH `
+              -Path $updatePath `
+              -Body $updateBody
+          }
+          else {
+            Write-Host "Creating initial pruning selection variable."
+
+            $createPath = "/varsets/$($varset.id)/relationships/vars"
+
+            Write-Host "POST endpoint: $api$createPath"
+
+            $createBody = @{
+              data = @{
+                type = "vars"
+                attributes = @{
+                  key         = "pomology_varieties"
+                  value       = $pomologyVarietiesJson
+                  category    = "terraform"
+                  hcl         = $true
+                  sensitive   = $false
+                  description = "Pomology selections used for enterprise pomology pruning."
+                }
+              }
+            }
+
+            Write-Host "POST payload:"
+            Write-Host ($createBody | ConvertTo-Json -Depth 20)
+
+            $updatedVariable = Invoke-HcpApi `
+              -Method POST `
+              -Path $createPath `
+              -Body $createBody
+          }
+
+          Write-Host "Variable write response:"
+          Write-Host ($updatedVariable | ConvertTo-Json -Depth 20)
+
+          if ($updatedVariable.data.attributes.key -ne "pomology_varieties") {
+            throw "HCP Terraform did not confirm the pruning selection variable."
+          }
+
+          if ($updatedVariable.data.attributes.value -cne $pomologyVarietiesJson) {
+            throw "HCP Terraform did not confirm the requested pruning selections."
+          }
+
+          Write-Host "Pruning selection variable successfully updated."
+
+          # Capture the current configuration sequence.
+
+          $configurations = @(
+            Get-HcpCollection `
+              -Path "/stacks/$env:HCP_STACK_ID/stack-configurations?page%5Bsize%5D=100"
+          )
+
+          $baselineSequence = 0
+
+          if ($configurations.Count -gt 0) {
+            $baselineConfiguration = $configurations |
+              Sort-Object {
+                [int]$_.attributes.'sequence-number'
+              } -Descending |
+              Select-Object -First 1
+
+            $baselineSequence = [int]$baselineConfiguration.attributes.'sequence-number'
+          }
+
+          Write-Host "Baseline configuration sequence: $baselineSequence"
+
+          # Trigger VCS ingestion from the configured branch.
+
+          $fetchStartedAt = [DateTimeOffset]::UtcNow
+
+          Write-Host "Triggering VCS fetch for Stack '$env:HCP_STACK_ID'."
+
+          $fetch = Invoke-WebRequest `
+            -Method POST `
+            -Uri "$api/stacks/$env:HCP_STACK_ID/fetch-latest-from-vcs" `
+            -Headers $headers `
+            -ContentType "application/vnd.api+json" `
+            -ErrorAction Stop
+
+          Write-Host "VCS fetch HTTP status: $($fetch.StatusCode)"
+
+          if ($fetch.StatusCode -notin @(200, 204)) {
+            throw "Unexpected VCS fetch response: $($fetch.StatusCode)"
+          }
+
+          Write-Host "VCS fetch accepted."
+
+          # Discover the configuration created by this fetch.
+
+          $deadline = [DateTimeOffset]::UtcNow.AddMinutes(10)
+          $configuration = $null
+
+          while ([DateTimeOffset]::UtcNow -lt $deadline) {
+            $configurations = @(
+              Get-HcpCollection `
+                -Path "/stacks/$env:HCP_STACK_ID/stack-configurations?page%5Bsize%5D=100"
+            )
+
+            $configuration = $configurations |
+              Where-Object {
+                [int]$_.attributes.'sequence-number' -gt $baselineSequence -and
+                [DateTimeOffset]::Parse($_.attributes.'created-at') -ge $fetchStartedAt.AddMinutes(-1)
+              } |
+              Sort-Object {
+                [int]$_.attributes.'sequence-number'
+              } -Descending |
+              Select-Object -First 1
+
+            if ($configuration) {
+              break
+            }
+
+            Write-Host "Waiting for a new Stack configuration."
+            Start-Sleep -Seconds 10
+          }
+
+          if (-not $configuration) {
+            throw "VCS fetch did not create a new Stack configuration."
+          }
+
+          $configurationId = $configuration.id
+
+          Write-Host "Configuration: $configurationId"
+          Write-Host "Sequence: $($configuration.attributes.'sequence-number')"
+
+          # Wait for configuration preparation.
+
+          $deadline = [DateTimeOffset]::UtcNow.AddMinutes(10)
+          $configurationStatus = $null
+
+          while ([DateTimeOffset]::UtcNow -lt $deadline) {
+            $detail = Invoke-HcpApi `
+              -Method GET `
+              -Path "/stack-configurations/$configurationId"
+
+            $configurationStatus = $detail.data.attributes.status
+
+            Write-Host "Configuration status: $configurationStatus"
+
+            if ($configurationStatus -eq "completed") {
+              break
+            }
+
+            if ($configurationStatus -in @(
+              "errored",
+              "failed",
+              "canceled",
+              "cancelled"
+            )) {
+              throw "Configuration preparation failed: $configurationStatus"
+            }
+
+            Start-Sleep -Seconds 10
+          }
+
+          if ($configurationStatus -ne "completed") {
+            throw "Timed out waiting for configuration preparation."
+          }
+
+          # Find the pruning deployment run.
+
+          $deadline = [DateTimeOffset]::UtcNow.AddMinutes(10)
+          $deploymentRun = $null
+
+          while ([DateTimeOffset]::UtcNow -lt $deadline) {
+            $runs = @(
+              Get-HcpCollection `
+                -Path "/stack-configurations/$configurationId/stack-deployment-runs"
+            )
+
+            $deploymentRun = $runs |
+              Where-Object {
+                $_.attributes.deployment -eq "prune" -and
+                $_.relationships.'stack-configuration'.data.id -eq $configurationId
+              } |
+              Select-Object -First 1
+
+            if ($deploymentRun) {
+              break
+            }
+
+            Write-Host "Waiting for the prune deployment run."
+            Start-Sleep -Seconds 10
+          }
+
+          if (-not $deploymentRun) {
+            throw "No prune deployment run appeared for configuration '$configurationId'."
+          }
+
+          $runId = $deploymentRun.id
+
+          Write-Host "Deployment run: $runId"
+
+          # Wait for planning and approve this run.
+
+          $deadline = [DateTimeOffset]::UtcNow.AddMinutes(345)
+          $approved = $false
+          $failureStatuses = @(
+            "failed",
+            "errored",
+            "abandoned",
+            "canceled",
+            "cancelled"
+          )
+
+          while ([DateTimeOffset]::UtcNow -lt $deadline) {
+            $response = Invoke-HcpApi `
+              -Method GET `
+              -Path "/stack-deployment-runs/$runId"
+
+            $status = $response.data.attributes.status
+
+            Write-Host "Deployment run '$runId': $status"
+
+            if ($status -eq "succeeded") {
+              break
+            }
+
+            if ($status -in $failureStatuses) {
+              throw "Deployment failed: $status"
+            }
+
+            if (
+              -not $approved -and
+              $status -in @(
+                "pre-deploying-pending-operator",
+                "deploying-pending-operator"
+              )
+            ) {
+              Write-Host "Deployment run requires operator approval. Approving..."
+
+              $null = Invoke-HcpApi `
+                -Method POST `
+                -Path "/stack-deployment-runs/$runId/approve-all-plans"
+
+              $approved = $true
+              Write-Host "Approved deployment run '$runId'."
+            }
+
+            Start-Sleep -Seconds 20
+          }
+
+          if ($status -ne "succeeded") {
+            throw "Timed out waiting for deployment run '$runId'. Last status: $status"
+          }
+
+          Write-Host "Enterprise pomology pruning succeeded."
